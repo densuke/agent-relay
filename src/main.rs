@@ -35,6 +35,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 struct AppState {
     bus: Arc<Mutex<Bus>>,
+    /// 既定（localhost）に加えて許可する Origin。リバースプロキシ経由の公開用。
+    allowed_origins: Arc<Vec<String>>,
 }
 
 #[tokio::main]
@@ -42,8 +44,29 @@ async fn main() {
     // 既定は localhost のみ。外部公開したい場合だけ明示的に上書きさせる
     let addr = std::env::var("AGENT_RELAY_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_string());
 
+    // 参加の合言葉。公開ホストへ置くなら設定する。未設定なら誰でも参加できる
+    let join_secret = std::env::var("AGENT_RELAY_JOIN_SECRET").ok();
+    // リバースプロキシ越しに公開する場合、そのホスト名を許可する必要がある
+    let allowed_origins: Vec<String> = std::env::var("AGENT_RELAY_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let bus = Bus::with_join_secret(join_secret);
+    if bus.requires_secret() {
+        println!("参加には合言葉が必要です (AGENT_RELAY_JOIN_SECRET)");
+    } else {
+        println!("警告: 合言葉が未設定です。到達できる相手は誰でも参加できます");
+    }
+    if !allowed_origins.is_empty() {
+        println!("許可する Origin: {}", allowed_origins.join(", "));
+    }
+
     let state = AppState {
-        bus: Arc::new(Mutex::new(Bus::new())),
+        bus: Arc::new(Mutex::new(bus)),
+        allowed_origins: Arc::new(allowed_origins),
     };
 
     let app = Router::new()
@@ -116,6 +139,7 @@ async fn mcp_endpoint(
     // （curl や MCP クライアントは付けてこないことが多い）
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
         && !is_allowed_origin(origin)
+        && !state.allowed_origins.iter().any(|o| o == origin)
     {
         return (StatusCode::FORBIDDEN, "Origin が許可されていません").into_response();
     }

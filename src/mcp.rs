@@ -89,24 +89,27 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "register",
-                "description": "このセッションの名前をリレーへ登録する。最初に一度だけ呼ぶ。",
+                "description": "このセッションの名前を登録し、以降の操作に使うトークンを受け取る。最初に一度だけ呼ぶ。返ってきた token は他のツールで必要になるので覚えておくこと。サーバが合言葉を要求する設定なら secret も渡す。",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "name": { "type": "string", "description": "自分の名前（例: honten / shiten）" } },
+                    "properties": {
+                        "name": { "type": "string", "description": "自分の名前（例: honten / shiten）" },
+                        "secret": { "type": "string", "description": "参加の合言葉（サーバが要求する場合のみ）" }
+                    },
                     "required": ["name"]
                 }
             },
             {
                 "name": "send_message",
-                "description": "指定した相手へメッセージを送る。相手が未登録でも送れる（後から受け取れる）。",
+                "description": "指定した相手へメッセージを送る。送信者は token から判別されるので名乗る必要はない。相手が未登録でも送れる（後から受け取れる）。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "from": { "type": "string", "description": "自分の名前" },
+                        "token": { "type": "string", "description": "register で受け取ったトークン" },
                         "to": { "type": "string", "description": "宛先の名前" },
                         "body": { "type": "string", "description": "本文" }
                     },
-                    "required": ["from", "to", "body"]
+                    "required": ["token", "to", "body"]
                 }
             },
             {
@@ -114,14 +117,23 @@ fn tools_list() -> Value {
                 "description": "自分宛の未読を取り出す。取り出したものは消える。未読が無ければ空。",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "name": { "type": "string", "description": "自分の名前" } },
-                    "required": ["name"]
+                    "properties": { "token": { "type": "string", "description": "register で受け取ったトークン" } },
+                    "required": ["token"]
                 }
             },
             {
                 "name": "list_peers",
                 "description": "登録済みのピア一覧を返す。",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "unregister",
+                "description": "登録を解除する。名前が空くので同じ名前で登録し直せる。未読は破棄される。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "token": { "type": "string", "description": "register で受け取ったトークン" } },
+                    "required": ["token"]
+                }
             }
         ]
     })
@@ -137,23 +149,24 @@ fn call_tool(bus: &mut Bus, params: &Value) -> Result<Value, String> {
     let text = match name {
         "register" => {
             let who = str_arg(&args, "name")?;
-            let is_new = bus.register(&who);
-            if is_new {
-                format!("{who} を登録しました")
-            } else {
-                format!("{who} は登録済みです")
-            }
+            // 合言葉を要求する設定のときだけ secret が要る
+            let secret = args.get("secret").and_then(Value::as_str);
+            let token = bus.register(&who, secret).map_err(|e| e.to_string())?;
+            // トークンはこの応答でしか渡らない。失うと登録し直しになる旨を添える
+            format!(
+                "{who} として登録しました。\ntoken: {token}\n（以降の send_message / poll_messages でこのトークンを使ってください）"
+            )
         }
         "send_message" => {
-            let from = str_arg(&args, "from")?;
+            let token = str_arg(&args, "token")?;
             let to = str_arg(&args, "to")?;
             let body = str_arg(&args, "body")?;
-            let msg = bus.send(&from, &to, &body);
-            format!("送信しました (id={})", msg.id)
+            let msg = bus.send(&token, &to, &body).map_err(|e| e.to_string())?;
+            format!("{} -> {} へ送信しました (id={})", msg.from, msg.to, msg.id)
         }
         "poll_messages" => {
-            let who = str_arg(&args, "name")?;
-            let msgs = bus.poll(&who);
+            let token = str_arg(&args, "token")?;
+            let msgs = bus.poll(&token).map_err(|e| e.to_string())?;
             if msgs.is_empty() {
                 "未読はありません".to_string()
             } else {
@@ -167,6 +180,11 @@ fn call_tool(bus: &mut Bus, params: &Value) -> Result<Value, String> {
             } else {
                 peers.join(", ")
             }
+        }
+        "unregister" => {
+            let token = str_arg(&args, "token")?;
+            let who = bus.unregister(&token).map_err(|e| e.to_string())?;
+            format!("{who} の登録を解除しました")
         }
         other => return Err(format!("未知のツール: {other}")),
     };
@@ -201,6 +219,7 @@ mod tests {
         }
     }
 
+    /// ツールを呼び、返ってきた本文（text）を取り出す。
     fn call(bus: &mut Bus, tool: &str, args: Value) -> String {
         let raw = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -210,7 +229,26 @@ mod tests {
         let v = reply(bus, &raw);
         v["result"]["content"][0]["text"]
             .as_str()
-            .expect("text が返るはず")
+            .unwrap_or_else(|| panic!("text が返るはず: {v}"))
+            .to_string()
+    }
+
+    /// ツールを呼び、JSON-RPC のエラーを取り出す。
+    fn call_err(bus: &mut Bus, tool: &str, args: Value) -> Value {
+        let raw = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        })
+        .to_string();
+        reply(bus, &raw)["error"].clone()
+    }
+
+    /// 登録してトークン部分だけを抜き出す。
+    fn register(bus: &mut Bus, name: &str) -> String {
+        let text = call(bus, "register", json!({ "name": name }));
+        text.lines()
+            .find_map(|l| l.strip_prefix("token: "))
+            .unwrap_or_else(|| panic!("token 行があるはず: {text}"))
             .to_string()
     }
 
@@ -223,7 +261,6 @@ mod tests {
         );
         assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(v["result"]["serverInfo"]["name"], "agent-relay");
-        // tools を持つことを宣言する
         assert!(v["result"]["capabilities"]["tools"].is_object());
     }
 
@@ -239,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_listで4つのツールを返す() {
+    fn tools_listで5つのツールを返す() {
         let mut bus = Bus::new();
         let v = reply(
             &mut bus,
@@ -249,9 +286,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["register", "send_message", "poll_messages", "list_peers"]
+            [
+                "register",
+                "send_message",
+                "poll_messages",
+                "list_peers",
+                "unregister"
+            ]
         );
-        // 各ツールが inputSchema を持つこと（クライアントが引数を組み立てられる）
         for t in tools {
             assert!(
                 t["inputSchema"].is_object(),
@@ -262,28 +304,94 @@ mod tests {
     }
 
     #[test]
+    fn registerでトークンが返る() {
+        let mut bus = Bus::new();
+        let text = call(&mut bus, "register", json!({"name":"honten"}));
+        assert!(text.contains("honten として登録しました"));
+        assert!(text.contains("token: "), "トークンを渡すこと: {text}");
+    }
+
+    #[test]
     fn registerからpollまで一連の流れが通る() {
         let mut bus = Bus::new();
-        assert!(call(&mut bus, "register", json!({"name":"honten"})).contains("登録しました"));
-        assert!(call(&mut bus, "register", json!({"name":"shiten"})).contains("登録しました"));
+        let honten = register(&mut bus, "honten");
+        let shiten = register(&mut bus, "shiten");
 
         let sent = call(
             &mut bus,
             "send_message",
-            json!({"from":"honten","to":"shiten","body":"やあ"}),
+            json!({"token": honten, "to":"shiten", "body":"やあ"}),
         );
-        assert!(sent.contains("送信しました"));
+        assert!(
+            sent.contains("honten -> shiten"),
+            "送信者が分かること: {sent}"
+        );
 
-        let got = call(&mut bus, "poll_messages", json!({"name":"shiten"}));
+        let got = call(&mut bus, "poll_messages", json!({"token": shiten}));
         assert!(got.contains("やあ"), "本文が返るはず: {got}");
-        assert!(got.contains("honten"), "送信者が分かるはず: {got}");
+        assert!(got.contains("honten"), "送信者が入るはず: {got}");
+    }
+
+    #[test]
+    fn 送信者を詐称できない() {
+        // from を引数で受け取らない設計。トークンの持ち主が送信者になる
+        let mut bus = Bus::new();
+        let honten = register(&mut bus, "honten");
+        let shiten = register(&mut bus, "shiten");
+
+        // 引数に from を紛れ込ませても無視される
+        call(
+            &mut bus,
+            "send_message",
+            json!({"token": honten, "to":"shiten", "body":"x", "from":"shacho"}),
+        );
+
+        let got = call(&mut bus, "poll_messages", json!({"token": shiten}));
+        assert!(got.contains("honten"), "実際の送信者になること: {got}");
+        assert!(!got.contains("shacho"), "詐称した名前は入らない: {got}");
+    }
+
+    #[test]
+    fn 不正なトークンでの送信は拒否される() {
+        let mut bus = Bus::new();
+        register(&mut bus, "shiten");
+        let err = call_err(
+            &mut bus,
+            "send_message",
+            json!({"token":"nisemono", "to":"shiten", "body":"なりすまし"}),
+        );
+        assert_eq!(err["code"], code::INVALID_PARAMS);
+        assert!(
+            err["message"].as_str().unwrap().contains("トークン"),
+            "理由が分かること: {}",
+            err["message"]
+        );
+    }
+
+    #[test]
+    fn 不正なトークンでの受信は拒否される() {
+        let mut bus = Bus::new();
+        let err = call_err(&mut bus, "poll_messages", json!({"token":"nisemono"}));
+        assert_eq!(err["code"], code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn 同じ名前の二重登録は拒否される() {
+        let mut bus = Bus::new();
+        register(&mut bus, "honten");
+        let err = call_err(&mut bus, "register", json!({"name":"honten"}));
+        assert_eq!(err["code"], code::INVALID_PARAMS);
+        assert!(err["message"].as_str().unwrap().contains("既に使われ"));
     }
 
     #[test]
     fn 未読が無いときは分かる文言を返す() {
         let mut bus = Bus::new();
-        let got = call(&mut bus, "poll_messages", json!({"name":"honten"}));
-        assert_eq!(got, "未読はありません");
+        let honten = register(&mut bus, "honten");
+        assert_eq!(
+            call(&mut bus, "poll_messages", json!({"token": honten})),
+            "未読はありません"
+        );
     }
 
     #[test]
@@ -293,9 +401,24 @@ mod tests {
             call(&mut bus, "list_peers", json!({})),
             "登録されているピアはいません"
         );
-        call(&mut bus, "register", json!({"name":"honten"}));
-        call(&mut bus, "register", json!({"name":"shiten"}));
+        register(&mut bus, "honten");
+        register(&mut bus, "shiten");
         assert_eq!(call(&mut bus, "list_peers", json!({})), "honten, shiten");
+    }
+
+    #[test]
+    fn unregisterで登録を解除できる() {
+        let mut bus = Bus::new();
+        let honten = register(&mut bus, "honten");
+        let text = call(&mut bus, "unregister", json!({"token": honten}));
+        assert!(text.contains("honten の登録を解除"));
+        assert_eq!(
+            call(&mut bus, "list_peers", json!({})),
+            "登録されているピアはいません"
+        );
+        // 解除後のトークンは使えない
+        let err = call_err(&mut bus, "poll_messages", json!({"token": honten}));
+        assert_eq!(err["code"], code::INVALID_PARAMS);
     }
 
     #[test]
@@ -307,19 +430,14 @@ mod tests {
 
     #[test]
     fn 引数不足はinvalid_paramsを返す() {
-        // body を落とした send_message
         let mut bus = Bus::new();
-        let raw = json!({
-            "jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params": { "name":"send_message", "arguments": {"from":"a","to":"b"} }
-        })
-        .to_string();
-        let v = reply(&mut bus, &raw);
-        assert_eq!(v["error"]["code"], code::INVALID_PARAMS);
+        let honten = register(&mut bus, "honten");
+        let err = call_err(&mut bus, "send_message", json!({"token": honten, "to":"b"}));
+        assert_eq!(err["code"], code::INVALID_PARAMS);
         assert!(
-            v["error"]["message"].as_str().unwrap().contains("body"),
+            err["message"].as_str().unwrap().contains("body"),
             "どの引数が足りないか分かること: {}",
-            v["error"]["message"]
+            err["message"]
         );
     }
 
@@ -332,7 +450,6 @@ mod tests {
 
     #[test]
     fn pingに空の結果を返す() {
-        // 疎通確認。仕様上 result は空オブジェクト
         let mut bus = Bus::new();
         let v = reply(&mut bus, r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#);
         assert_eq!(v["result"], json!({}));
