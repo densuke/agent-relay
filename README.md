@@ -64,20 +64,28 @@ claude mcp add --transport http agent-relay http://127.0.0.1:8765/mcp
 
 | ツール | 引数 | 動作 |
 |---|---|---|
-| `register` | `name` | このセッションの名前を登録する。最初に一度だけ呼ぶ |
-| `send_message` | `from`, `to`, `body` | 指定した相手へ送る |
-| `poll_messages` | `name` | 自分宛の未読を取り出す（取り出したら消える） |
+| `register` | `name`, `secret`（任意） | 名前を登録し、**トークンを受け取る**。最初に一度だけ呼ぶ |
+| `send_message` | `token`, `to`, `body` | 指定した相手へ送る |
+| `poll_messages` | `token` | 自分宛の未読を取り出す（取り出したら消える） |
 | `list_peers` | なし | 登録済みのピア一覧 |
+| `unregister` | `token` | 登録を解除する（名前が空く。未読は破棄） |
 
 会話の例です。
 
 ```
 [ホストA] register(name="alice")
+         => alice として登録しました。
+            token: 3f9a1c...
+
 [ホストB] register(name="bob")
-[ホストA] send_message(from="alice", to="bob", body="ビルド通った？")
-[ホストB] poll_messages(name="bob")
+         => token: 7d2e40...
+
+[ホストA] send_message(token="3f9a1c...", to="bob", body="ビルド通った？")
+[ホストB] poll_messages(token="7d2e40...")
          => [{ "id": 0, "from": "alice", "to": "bob", "body": "ビルド通った？" }]
 ```
+
+送信者名を引数で受け取らないのは、他人を騙って送れないようにするためです。`from` はサーバーがトークンから決めます。
 
 ### 動作確認
 
@@ -85,6 +93,14 @@ claude mcp add --transport http agent-relay http://127.0.0.1:8765/mcp
 curl -s http://127.0.0.1:8765/healthz
 # => {"status":"ok","peers":2,"pending":0}
 ```
+
+## 環境変数
+
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `AGENT_RELAY_ADDR` | `127.0.0.1:8765` | 待ち受けアドレス |
+| `AGENT_RELAY_JOIN_SECRET` | なし | `register` に必要な合言葉。公開時は必須 |
+| `AGENT_RELAY_ALLOWED_ORIGINS` | なし | 追加で許可する Origin（カンマ区切り） |
 
 ## 設計について
 
@@ -111,7 +127,43 @@ MCP の仕様が挙げている注意点に従っています。
 - **既定で 127.0.0.1 のみを待ち受ける**。全インターフェースには開きません
 - **`Origin` ヘッダを検証する**（DNS リバインディング対策）。ホスト名を取り出して完全一致で判定するので、`http://localhost.evil.example.com` のような偽装は弾きます
 
-認証機構は持っていません。SSH ポートフォワード越しに使うことを前提としているためです。インターネットに直接公開しないでください。
+### 参加を制限する
+
+`AGENT_RELAY_JOIN_SECRET` を設定すると、`register` に合言葉が要るようになります。
+
+```bash
+AGENT_RELAY_JOIN_SECRET=your-secret agent-relay
+```
+
+```
+register(name="alice", secret="your-secret")   # 通る
+register(name="intruder")                       # 拒否される
+```
+
+**公開ホストに置く場合は必ず設定してください。** 未設定だと、到達できる相手は誰でもピアとして参加でき、メッセージを送ったり `list_peers` で構成を覗いたりできます。未設定で起動すると警告を出します。
+
+役割が2段に分かれています。
+
+- **合言葉** — 参加してよい相手かどうか（入口）
+- **トークン** — 誰として送るか（同定）
+
+### リバースプロキシ越しに公開する
+
+Caddy や nginx の後ろに置く場合、そのホスト名を許可してください。
+
+```bash
+AGENT_RELAY_ALLOWED_ORIGINS=https://relay.example.com agent-relay
+```
+
+カンマ区切りで複数指定できます。既定の localhost は常に許可されます。
+
+agent-relay 自体は 127.0.0.1 を待ち受けたままにし、プロキシから転送する構成を推奨します。
+
+```
+外部 :9998  ──▶  Caddy  ──▶  127.0.0.1:8765 (agent-relay)
+```
+
+TLS の終端はプロキシに任せます。agent-relay は HTTP のみを話します。
 
 ## インストール
 
