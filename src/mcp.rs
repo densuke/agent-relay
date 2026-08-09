@@ -39,7 +39,10 @@ pub enum Outcome {
 }
 
 /// JSON-RPC メッセージを1件処理する。
-pub fn handle(bus: &mut Bus, raw: &str) -> Outcome {
+///
+/// `now` は UNIX 秒。ピアの生存判定に使う。呼び出し側から渡すことで、
+/// テストが実時計に依存しない。
+pub fn handle(bus: &mut Bus, raw: &str, now: u64) -> Outcome {
     let Ok(req): Result<Value, _> = serde_json::from_str(raw) else {
         return Outcome::Reply(error_response(
             Value::Null,
@@ -66,7 +69,7 @@ pub fn handle(bus: &mut Bus, raw: &str) -> Outcome {
     match method {
         "initialize" => Outcome::Reply(result_response(id, initialize_result())),
         "tools/list" => Outcome::Reply(result_response(id, tools_list())),
-        "tools/call" => match call_tool(bus, &params) {
+        "tools/call" => match call_tool(bus, &params, now) {
             Ok(v) => Outcome::Reply(result_response(id, v)),
             Err(msg) => Outcome::Reply(error_response(id, code::INVALID_PARAMS, &msg)),
         },
@@ -139,7 +142,7 @@ fn tools_list() -> Value {
     })
 }
 
-fn call_tool(bus: &mut Bus, params: &Value) -> Result<Value, String> {
+fn call_tool(bus: &mut Bus, params: &Value, now: u64) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -151,7 +154,7 @@ fn call_tool(bus: &mut Bus, params: &Value) -> Result<Value, String> {
             let who = str_arg(&args, "name")?;
             // 合言葉を要求する設定のときだけ secret が要る
             let secret = args.get("secret").and_then(Value::as_str);
-            let token = bus.register(&who, secret).map_err(|e| e.to_string())?;
+            let token = bus.register(&who, secret, now).map_err(|e| e.to_string())?;
             // トークンはこの応答でしか渡らない。失うと登録し直しになる旨を添える
             format!(
                 "{who} として登録しました。\ntoken: {token}\n（以降の send_message / poll_messages でこのトークンを使ってください）"
@@ -161,12 +164,14 @@ fn call_tool(bus: &mut Bus, params: &Value) -> Result<Value, String> {
             let token = str_arg(&args, "token")?;
             let to = str_arg(&args, "to")?;
             let body = str_arg(&args, "body")?;
-            let msg = bus.send(&token, &to, &body).map_err(|e| e.to_string())?;
+            let msg = bus
+                .send(&token, &to, &body, now)
+                .map_err(|e| e.to_string())?;
             format!("{} -> {} へ送信しました (id={})", msg.from, msg.to, msg.id)
         }
         "poll_messages" => {
             let token = str_arg(&args, "token")?;
-            let msgs = bus.poll(&token).map_err(|e| e.to_string())?;
+            let msgs = bus.poll(&token, now).map_err(|e| e.to_string())?;
             if msgs.is_empty() {
                 "未読はありません".to_string()
             } else {
@@ -213,7 +218,7 @@ mod tests {
     use super::*;
 
     fn reply(bus: &mut Bus, raw: &str) -> Value {
-        match handle(bus, raw) {
+        match handle(bus, raw, 0) {
             Outcome::Reply(s) => serde_json::from_str(&s).expect("JSON として返るはず"),
             Outcome::Accepted => panic!("Reply を期待したが Accepted だった"),
         }
@@ -271,6 +276,7 @@ mod tests {
         let out = handle(
             &mut bus,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            0,
         );
         assert_eq!(out, Outcome::Accepted);
     }

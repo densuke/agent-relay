@@ -40,11 +40,13 @@ jobs:
       - name: build
         run: cargo build --release --target ${{ matrix.target }}
 
+      # サーバ本体と shim を1つの tar にまとめる。片方だけ古いとプロトコルが
+      # ずれるため、常に対で配る
       - name: package
         run: |
-          BIN=target/${{ matrix.target }}/release/agent-relay
+          DIR=target/${{ matrix.target }}/release
           NAME=agent-relay-${{ matrix.target }}
-          tar czf "${NAME}.tar.gz" -C "$(dirname "$BIN")" agent-relay
+          tar czf "${NAME}.tar.gz" -C "$DIR" agent-relay agent-relay-shim
           sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" 2>/dev/null \
             || shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
 
