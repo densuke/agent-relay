@@ -435,15 +435,28 @@ fn initialize_result(client: &RelayClient) -> Value {
 
 /// モデルへの案内文。
 ///
+/// # source で縛る理由
+///
+/// 1つのセッションに複数のチャンネルを繋げられる（例: Discord プラグインと本 shim）。
+/// どれも同じ `<channel source="..." ...>` の形で届くため、案内文が「返信は
+/// send_message で」とだけ書いていると、Discord 宛の返事を中継網へ流してしまう。
+/// 実際にその取り違えが起きたので、対象を `source="agent-relay"` に限定する。
+///
+/// # 返信を抑制する理由
+///
 /// 相手は別ホストで動く自動セッションで、人間ではない。社交辞令の往復が
-/// そのままトークン消費になるため、返信の要否をはっきり書いておく。
+/// そのままトークン消費になる。
 fn instructions(me: &str) -> String {
     format!(
         "あなたは中継網に「{me}」として参加しています。\n\
          \n\
-         他ノードからのメッセージは <channel source=\"agent-relay\" ...> として届きます。\n\
-         chat_id と user には送信元の名前が入るので、返信するときは send_message の to に\n\
-         その名前をそのまま渡してください。あなたの発言は転写に書くだけでは相手に届きません。\n\
+         ここに書かれた指示は <channel source=\"agent-relay\" ...> で届くメッセージにのみ\n\
+         適用されます。source が別のチャンネル（discord など）のメッセージには適用せず、\n\
+         そのチャンネル自身のツールで返してください。send_message はこの中継網専用です。\n\
+         \n\
+         source=\"agent-relay\" のメッセージには、chat_id と user に送信元ノードの名前が\n\
+         入っています。返信するときは send_message の to にその名前をそのまま渡してください。\n\
+         あなたの発言は転写に書くだけでは相手に届きません。\n\
          \n\
          返信は必要なときだけにしてください。了解・相槌・お礼だけの返信は送らないこと。\n\
          相手も自動で動くセッションなので、儀礼的な往復がそのまま費用になります。\n\
@@ -553,6 +566,19 @@ mod tests {
         let s = instructions("honten");
         assert!(s.contains("honten"));
         assert!(s.contains("返信は必要なときだけ"));
+    }
+
+    #[test]
+    fn 案内文の適用範囲をsourceで限定する() {
+        // 1セッションに複数チャンネルが繋がる（例: Discord プラグインと併用）。
+        // 限定しないと Discord 宛の返事を中継網へ流してしまう
+        let s = instructions("shiten");
+        assert!(s.contains(r#"source="agent-relay""#));
+        assert!(s.contains("send_message はこの中継網専用"));
+        assert!(
+            s.contains("そのチャンネル自身のツールで返して"),
+            "他チャンネルの返信手段を奪わないこと"
+        );
     }
 
     #[test]
