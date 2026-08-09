@@ -31,6 +31,18 @@ use axum::{
 };
 use bus::Bus;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 現在の UNIX 秒。ピアの生存判定に使う。
+///
+/// 時計が UNIX_EPOCH より前を指す異常時は 0 に倒す。失効判定が働かなくなるだけで、
+/// サーバを落とすほどのことではない。
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -118,7 +130,9 @@ async fn shutdown_signal() {
 
 async fn healthz(State(state): State<AppState>) -> Response {
     let (peers, pending) = {
-        let bus = state.bus.lock().expect("bus lock");
+        let mut bus = state.bus.lock().expect("bus lock");
+        // 失効済みを数に含めない。監視から見て「生きているピア数」であってほしい
+        bus.sweep(now_secs());
         (bus.peers().len(), bus.pending_count())
     };
     (
@@ -163,7 +177,7 @@ async fn mcp_endpoint(
 
     let outcome = {
         let mut bus = state.bus.lock().expect("bus lock");
-        mcp::handle(&mut bus, &body)
+        mcp::handle(&mut bus, &body, now_secs())
     };
 
     match outcome {

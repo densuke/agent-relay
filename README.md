@@ -2,7 +2,17 @@
 
 別のマシンで動く AI コーディングエージェント同士が、メッセージをやり取りするための小さな MCP サーバーです。
 
-常駐時のメモリは **約 2.4MB**、バイナリは **約 600KB**。非力なホストに置くことを想定しています。
+常駐時のメモリは **約 1.0MB**（musl ビルド実測）、バイナリは **約 900KB**。非力なホストに置くことを想定しています。
+
+配布物には2つのバイナリが入っています。
+
+| バイナリ | 役割 | 置き場所 |
+|---|---|---|
+| `agent-relay` | 中継サーバー本体（HTTP） | どこか1台 |
+| `agent-relay-shim` | 各エージェントが繋ぐ stdio MCP サーバー | エージェントを動かす各ホスト |
+
+`agent-relay` だけでも動きます（各エージェントが HTTP MCP として直接繋ぎ、`poll_messages` で取りに行く形）。
+shim を挟むと、届いたメッセージが Claude Code のセッションに**そのまま割り込む**ようになります。詳細は下記「Claude Code へ push する」を参照してください。
 
 ## 何のためのものか
 
@@ -94,6 +104,88 @@ curl -s http://127.0.0.1:8765/healthz
 # => {"status":"ok","peers":2,"pending":0}
 ```
 
+## Claude Code へ push する
+
+ここまでの構成では、エージェントは自分で `poll_messages` を呼ばないと着信に気づけません。`agent-relay-shim` を挟むと、届いたメッセージが**セッションに割り込む**ようになります。相手に話しかけられたら、そのまま会話が始まります。
+
+仕組みは Claude Code の `claude/channel` を使っています。この capability を宣言した MCP サーバーが `notifications/claude/channel` を送ると、その内容が新しいターンとして注入されます。公式の Discord プラグインと同じ経路です。
+
+### 使えるための条件
+
+`claude/channel` にはゲートがあります。次を満たさないと通知は捨てられます（Claude Code 2.1.226 で確認）。
+
+- **stdio トランスポートであること** — HTTP 接続は「unsolicited notification path が無い」として弾かれます。shim が stdio で立つのはこのためです
+- **起動時に `--channels` で明示されていること** — セッションごとの opt-in です
+- **対話モードであること** — `-p` のヘッドレス実行では登録処理そのものが走りません
+- ファーストパーティのプロバイダであること（Bedrock / Vertex / Foundry では使えません）
+- 組織のポリシーで無効化されていないこと
+
+### 設定
+
+まず接続情報を `~/.config/agent-relay/env` に置きます。shim がここから読むので、**合言葉がモデルのコンテキストに載りません**。
+
+```bash
+mkdir -p ~/.config/agent-relay && chmod 700 ~/.config/agent-relay
+cat > ~/.config/agent-relay/env <<'EOF'
+AGENT_RELAY_URL=https://relay.example.com/mcp
+AGENT_RELAY_JOIN_SECRET=your-secret
+AGENT_RELAY_NAME=honten
+EOF
+chmod 600 ~/.config/agent-relay/env
+```
+
+MCP サーバーとして登録します。
+
+```bash
+claude mcp add --scope user agent-relay ~/.local/bin/agent-relay-shim
+```
+
+起動時にチャンネルを有効化します。サーバー名は上で登録した名前（`agent-relay`）です。
+
+```bash
+claude --dangerously-load-development-channels server:agent-relay
+```
+
+初回は確認画面が出ます。承認済みのプラグインとして配る場合は `--channels plugin:<name>@<marketplace>` を使い、この開発用フラグは不要になります。
+
+既に別のチャンネルを使っている場合も、そのまま併記できます。
+
+```bash
+claude --channels plugin:discord@claude-plugins-official \
+       --dangerously-load-development-channels server:agent-relay
+```
+
+### モデルから見えるもの
+
+shim が公開するツールは2つだけです。
+
+| ツール | 引数 | 動作 |
+|---|---|---|
+| `send_message` | `to`, `body` | 相手へ送る |
+| `list_peers` | なし | 参加中のノード一覧 |
+
+`register` と `poll_messages` は shim が内部で行うので出てきません。トークンもモデルには渡りません。
+
+届いたメッセージはこう見えます。
+
+```
+← agent-relay · shiten: ビルド通った？
+```
+
+`meta.chat_id` と `meta.user` に送信元の名前が入るので、返信は `send_message(to="shiten", ...)` です。
+
+### 名前の重複
+
+同じ名前が埋まっていた場合、shim は `honten-2`、`honten-3` … と連番を付けて登録します。1 台のホストでセッションを何本も立てる運用で、後発が締め出されないようにするためです。
+
+### 返信の抑制
+
+相手も自動で動くセッションです。「了解」「ありがとう」の往復がそのままトークン消費になるため、shim の `instructions` で「返信は必要なときだけ」と指示しています。相槌だけの返信は送らないよう促されます。
+
+### この仕組みは experimental です
+
+`claude/channel` は Claude Code の非公開・実験的な機能で、ドキュメント化されていません。更新で黙って壊れる可能性があります。公式の Discord プラグイン（`external_plugins/discord`）が同じ経路を使っているので、動かなくなったらそちらの実装と Claude Code のバイナリを見比べるのが早いです。
+
 ## 環境変数
 
 | 変数 | 既定 | 用途 |
@@ -102,13 +194,32 @@ curl -s http://127.0.0.1:8765/healthz
 | `AGENT_RELAY_JOIN_SECRET` | なし | `register` に必要な合言葉。公開時は必須 |
 | `AGENT_RELAY_ALLOWED_ORIGINS` | なし | 追加で許可する Origin（カンマ区切り） |
 
+shim 側（`~/.config/agent-relay/env` からも読みます。環境変数が優先）。
+
+| 変数 | 既定 | 用途 |
+|---|---|---|
+| `AGENT_RELAY_URL` | `http://127.0.0.1:8765/mcp` | 中継サーバーのエンドポイント |
+| `AGENT_RELAY_JOIN_SECRET` | なし | 参加の合言葉 |
+| `AGENT_RELAY_NAME` | ホスト名 | 中継網での自分の名前 |
+| `AGENT_RELAY_POLL_MS` | `2000` | 受信を確認する間隔（ミリ秒） |
+
 ## 設計について
 
-### なぜ push ではなく poll なのか
+### なぜサーバー本体は poll なのか
 
-Claude Code のようなエージェントは、ツールを実行したタイミングでしか外部の情報を受け取れません。サーバーから一方的に送りつけても、次にツールが呼ばれるまで読まれません。それなら受信側が取りに来る形のほうが素直だと判断しました。
+中継サーバーは受信側が取りに来る形にしています。SSE ストリームは持ちません。MCP の Streamable HTTP 仕様でも、POST の中身がリクエストであれば `application/json` を単発で返してよいと定められています（SSE は必須ではありません）。GET には 405 を返します。
 
-この判断の結果、SSE ストリームを持たずに済んでいます。MCP の Streamable HTTP 仕様でも、POST の中身がリクエストであれば `application/json` を単発で返してよいと定められています（SSE は必須ではありません）。GET には 405 を返します。
+「それでは届いたことに気づけないのでは」という話は、shim 側で解決しています。shim が 2 秒間隔でサーバーを叩き、着信があった瞬間に Claude Code へ通知を上げます。**このポーリングはエージェントのターンの外で起きるので、トークンを一切消費しません。** 実際にメッセージが届いたときだけターンが立ちます。
+
+ポーリングの往復を端（shim）に閉じ込め、サーバー本体は単純な HTTP のままにする、という切り分けです。
+
+### ピアの登録は 60 秒で失効します
+
+`poll_messages` も `send_message` も呼ばれないまま 60 秒経つと、そのピアの登録は解除され、名前が空きます。shim は 2 秒間隔で叩くので、動いている限り失効しません。
+
+失効を設けているのは、落ちたセッションが名前を占有し続けるのを防ぐためです。1 台のホストで Claude Code のセッションが何本も立つ運用だと、これが無いと後から起動したセッションが同じ名前で参加できなくなります。
+
+失効の場合、受信箱の中身は**残します**。落ちたのか一時的に止まっているだけなのか区別できないので、復帰したときに受け取れるほうが実用的だと判断しました。明示的に `unregister` した場合だけは、本人が降りる意思を示しているので受信箱も破棄します。
 
 ### メッセージは短命です
 
