@@ -27,6 +27,13 @@ const TOKEN_BYTES: usize = 16;
 /// 再接続できなくなる（同じホストで何本もセッションが立つ運用では詰まる）。
 pub const PEER_TTL_SECS: u64 = 60;
 
+/// 1つの受信箱に積める上限。
+///
+/// 相手が二度と戻らない場合、受信箱は際限なく膨らむ。永続化すると
+/// そのままディスクを食うため頭を打っておく。超えた分は古いものから捨てるが、
+/// 捨てたことは呼び出し側へ返して黙って消えないようにする。
+pub const MAX_INBOX_MESSAGES: usize = 500;
+
 /// 1通のメッセージ。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
@@ -35,6 +42,14 @@ pub struct Message {
     pub from: String,
     pub to: String,
     pub body: String,
+}
+
+/// `send` の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sent {
+    pub msg: Message,
+    /// 上限を超えて捨てた古いメッセージの数。通常は 0
+    pub dropped: usize,
 }
 
 /// 操作が拒否された理由。
@@ -70,6 +85,11 @@ pub struct Bus {
     /// ピア名 -> 最後に接触した時刻（UNIX 秒）。失効判定に使う
     last_seen: HashMap<String, u64>,
     next_id: u64,
+    /// 受信箱の中身が最後の保存以降に変わったか。
+    ///
+    /// 空ポーリングでは変わらない。shim が2秒間隔で叩くので、これを見ないと
+    /// 何も起きていない時間帯にも書き込み続けることになる。
+    dirty: bool,
     /// 参加に必要な合言葉。`None` なら誰でも参加できる。
     ///
     /// 公開ホストに置く場合に、無関係な第三者がピアとして入り込むのを防ぐ。
@@ -175,7 +195,9 @@ impl Bus {
         self.last_seen.remove(&name);
         // 受信箱は残さない。次に同じ名前で登録した別人が読めてしまうため。
         // 失効（sweep）では残すが、こちらは本人が明示的に降りた意思表示なので破棄する
-        self.inboxes.remove(&name);
+        if self.inboxes.remove(&name).is_some() {
+            self.dirty = true;
+        }
         Ok(name)
     }
 
@@ -188,13 +210,7 @@ impl Bus {
     ///
     /// 宛先が未登録でも受信箱を作って積む。相手が後から `register` して
     /// `poll` すれば受け取れる。起動順に依存させないための判断。
-    pub fn send(
-        &mut self,
-        token: &str,
-        to: &str,
-        body: &str,
-        now: u64,
-    ) -> Result<Message, BusError> {
+    pub fn send(&mut self, token: &str, to: &str, body: &str, now: u64) -> Result<Sent, BusError> {
         let from = self.whoami(token)?.to_string();
         self.touch(token, now);
         let msg = Message {
@@ -204,11 +220,14 @@ impl Bus {
             body: body.to_string(),
         };
         self.next_id += 1;
-        self.inboxes
-            .entry(to.to_string())
-            .or_default()
-            .push(msg.clone());
-        Ok(msg)
+        let inbox = self.inboxes.entry(to.to_string()).or_default();
+        inbox.push(msg.clone());
+        let dropped = inbox.len().saturating_sub(MAX_INBOX_MESSAGES);
+        if dropped > 0 {
+            inbox.drain(..dropped);
+        }
+        self.dirty = true;
+        Ok(Sent { msg, dropped })
     }
 
     /// 自分宛の未読をすべて取り出す。取り出したものは受信箱から消える。
@@ -217,7 +236,26 @@ impl Bus {
     pub fn poll(&mut self, token: &str, now: u64) -> Result<Vec<Message>, BusError> {
         let name = self.whoami(token)?.to_string();
         self.touch(token, now);
-        Ok(self.inboxes.remove(&name).unwrap_or_default())
+        let got = self.inboxes.remove(&name).unwrap_or_default();
+        if !got.is_empty() {
+            self.dirty = true;
+        }
+        Ok(got)
+    }
+
+    /// 保存済みの受信箱を取り込む。起動時に一度だけ呼ぶ。
+    pub fn restore_inboxes(&mut self, inboxes: HashMap<String, Vec<Message>>) {
+        self.inboxes = inboxes;
+    }
+
+    /// 受信箱の中身。保存用。
+    pub fn inboxes(&self) -> &HashMap<String, Vec<Message>> {
+        &self.inboxes
+    }
+
+    /// 最後に確認して以降、受信箱が変わったか。確認すると印は下りる。
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
     }
 
     /// 受信箱に溜まっている総数。監視用。
@@ -425,6 +463,77 @@ mod tests {
             "省略も拒否する"
         );
         assert!(bus.peers().is_empty(), "拒否された相手は登録されない");
+    }
+
+    #[test]
+    fn 送信と受信で変更の印が立つ() {
+        // 保存の要否を判断するための印。空ポーリングで立ってはいけない
+        let mut bus = Bus::new();
+        let honten = reg(&mut bus, "honten");
+        let shiten = reg(&mut bus, "shiten");
+        bus.take_dirty();
+
+        assert!(bus.poll(&shiten, 0).unwrap().is_empty());
+        assert!(!bus.take_dirty(), "空ポーリングでは書き込む必要がない");
+
+        bus.send(&honten, "shiten", "本文", 0).unwrap();
+        assert!(bus.take_dirty(), "送信で変わる");
+        assert!(!bus.take_dirty(), "確認したら印は下りる");
+
+        bus.poll(&shiten, 0).unwrap();
+        assert!(bus.take_dirty(), "受け取って消えたので変わる");
+    }
+
+    #[test]
+    fn 登録解除でも変更の印が立つ() {
+        let mut bus = Bus::new();
+        let honten = reg(&mut bus, "honten");
+        let shiten = reg(&mut bus, "shiten");
+        bus.send(&honten, "shiten", "破棄される", 0).unwrap();
+        bus.take_dirty();
+
+        bus.unregister(&shiten).unwrap();
+        assert!(bus.take_dirty(), "受信箱を捨てたので変わる");
+    }
+
+    #[test]
+    fn 受信箱は上限を超えない() {
+        // 相手が二度と戻らない場合に、際限なく積み上がるのを防ぐ
+        let mut bus = Bus::new();
+        let honten = reg(&mut bus, "honten");
+
+        for i in 0..MAX_INBOX_MESSAGES {
+            let sent = bus.send(&honten, "kaeranai", &format!("{i}"), 0).unwrap();
+            assert_eq!(sent.dropped, 0, "上限までは捨てない");
+        }
+        let sent = bus.send(&honten, "kaeranai", "あふれる分", 0).unwrap();
+        assert_eq!(sent.dropped, 1, "捨てた件数を返す（黙って消さない）");
+
+        let later = reg(&mut bus, "kaeranai");
+        let got = bus.poll(&later, 0).unwrap();
+        assert_eq!(got.len(), MAX_INBOX_MESSAGES);
+        assert_eq!(got[0].body, "1", "古いものから捨てる");
+        assert_eq!(got[got.len() - 1].body, "あふれる分", "新しいものは残る");
+    }
+
+    #[test]
+    fn 保存した受信箱を取り込める() {
+        // サーバ再起動後、未読を持ち越して届けられること
+        let mut before = Bus::new();
+        let honten = reg(&mut before, "honten");
+        before
+            .send(&honten, "shiten", "落ちている間の伝言", 0)
+            .unwrap();
+        let saved = before.inboxes().clone();
+
+        let mut after = Bus::new();
+        after.restore_inboxes(saved);
+        let shiten = after.register("shiten", None, 0).unwrap();
+        let got = after.poll(&shiten, 0).unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].body, "落ちている間の伝言");
+        assert_eq!(got[0].from, "honten", "送信者も残る");
     }
 
     #[test]

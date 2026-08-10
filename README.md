@@ -212,6 +212,7 @@ shim の `instructions` は適用範囲を `source="agent-relay"` に明示的�
 | `AGENT_RELAY_ADDR` | `127.0.0.1:8765` | 待ち受けアドレス |
 | `AGENT_RELAY_JOIN_SECRET` | なし | `register` に必要な合言葉。公開時は必須 |
 | `AGENT_RELAY_ALLOWED_ORIGINS` | なし | 追加で許可する Origin（カンマ区切り） |
+| `AGENT_RELAY_STATE_FILE` | なし | 受信箱の保存先。設定すると再起動をまたいで未読が残る |
 
 shim 側（`~/.config/agent-relay/env` からも読みます。環境変数が優先）。
 
@@ -250,9 +251,25 @@ shim 側（`~/.config/agent-relay/env` からも読みます。環境変数が�
 |---|---|
 | ピアの登録が失効（60秒無応答） | **残る**（復帰したら受け取れる） |
 | 明示的な `unregister` | 破棄される |
-| 中継サーバーの再起動 | **失われる**（状態はメモリのみ） |
+| 中継サーバーの再起動 | 既定では**失われる**。`AGENT_RELAY_STATE_FILE` を設定すると残る |
 
-「エージェント同士がその場で会話する」ことに絞った設計です。相手が落ちている間の取り置きは効きますが、サーバーの再起動をまたぐ保証はありません。記録を残したいものは、Issue なり別の仕組みなりに書いてください。
+「エージェント同士がその場で会話する」ことに絞った設計です。記録を残したいものは、Issue なり別の仕組みなりに書いてください。
+
+### 再起動をまたいで未読を残す
+
+`AGENT_RELAY_STATE_FILE` を設定すると、受信箱をそのファイルへ保存し、起動時に読み戻します。
+
+```bash
+AGENT_RELAY_STATE_FILE=~/.local/state/agent-relay/inboxes.json agent-relay
+```
+
+相手が落ちている間に投げておいて後で拾ってもらう使い方をするなら、設定しておいてください。未設定なら従来どおりメモリのみです。
+
+保存するのは**受信箱だけ**で、ピアの登録とトークンは残しません。トークンを握っていたプロセスは再起動で消えていることが多く、shim は `UnknownToken` を受け取れば自分で登録し直すため、復元する実益がありません。資格情報をディスクに置かずに済むほうが安全です。
+
+書き込みは中身が変わったときだけ行います。shim は 2 秒間隔で叩いてきますが、未読が無ければ何も書きません。書き込みは一時ファイルへ出してから rename するので、途中で落ちても壊れた JSON が残りません。
+
+1 つの受信箱に積める上限は 500 件です。相手が二度と戻らない場合に際限なく膨らむのを防ぐためで、超えた分は古いものから捨てます。**捨てたことは送信側への応答に明記される**ので、黙って消えることはありません。
 
 ### 宛先が未登録でも送れます
 
@@ -327,6 +344,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment=AGENT_RELAY_STATE_FILE=%h/.local/state/agent-relay/inboxes.json
 ExecStart=%h/.local/bin/agent-relay
 Restart=always
 RestartSec=5

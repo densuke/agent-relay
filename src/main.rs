@@ -21,6 +21,7 @@
 
 mod bus;
 mod mcp;
+mod store;
 
 use axum::{
     Router,
@@ -32,6 +33,7 @@ use axum::{
 use bus::Bus;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use store::Store;
 
 /// 現在の UNIX 秒。ピアの生存判定に使う。
 ///
@@ -47,6 +49,8 @@ fn now_secs() -> u64 {
 #[derive(Clone)]
 struct AppState {
     bus: Arc<Mutex<Bus>>,
+    /// 受信箱の保存先。未設定ならメモリのみ（従来の挙動）
+    store: Arc<Option<Store>>,
     /// 既定（localhost）に加えて許可する Origin。リバースプロキシ経由の公開用。
     allowed_origins: Arc<Vec<String>>,
 }
@@ -66,7 +70,23 @@ async fn main() {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let bus = Bus::with_join_secret(join_secret);
+    // 受信箱の保存先。未設定ならメモリのみで、従来どおり再起動で未読は消える。
+    // 相手が不在の間の取り置きを再起動またぎで効かせたい場合に設定する
+    let store = std::env::var("AGENT_RELAY_STATE_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(Store::new);
+
+    let mut bus = Bus::with_join_secret(join_secret);
+    if let Some(st) = &store {
+        let restored = st.load();
+        let count: usize = restored.values().map(Vec::len).sum();
+        bus.restore_inboxes(restored);
+        println!(
+            "受信箱を {} に保存します（復元した未読 {count} 件）",
+            st.path().display()
+        );
+    }
     if bus.requires_secret() {
         println!("参加には合言葉が必要です (AGENT_RELAY_JOIN_SECRET)");
     } else {
@@ -78,6 +98,7 @@ async fn main() {
 
     let state = AppState {
         bus: Arc::new(Mutex::new(bus)),
+        store: Arc::new(store),
         allowed_origins: Arc::new(allowed_origins),
     };
 
@@ -175,10 +196,25 @@ async fn mcp_endpoint(
         _ => return (StatusCode::METHOD_NOT_ALLOWED, "POST を使ってください").into_response(),
     }
 
-    let outcome = {
+    let (outcome, snapshot) = {
         let mut bus = state.bus.lock().expect("bus lock");
-        mcp::handle(&mut bus, &body, now_secs())
+        let outcome = mcp::handle(&mut bus, &body, now_secs());
+        // 中身が変わったときだけ書く。shim は2秒間隔で叩いてくるので、
+        // 毎回書くと何も起きていない時間帯もディスクを回し続けることになる
+        let snapshot = if state.store.is_some() && bus.take_dirty() {
+            Some(bus.inboxes().clone())
+        } else {
+            None
+        };
+        (outcome, snapshot)
     };
+
+    if let (Some(st), Some(snapshot)) = (state.store.as_ref(), snapshot)
+        && let Err(e) = st.save(&snapshot)
+    {
+        // 保存に失敗しても中継そのものは続ける。届けることを優先する
+        eprintln!("受信箱を保存できませんでした: {e}");
+    }
 
     match outcome {
         mcp::Outcome::Reply(json) => (
