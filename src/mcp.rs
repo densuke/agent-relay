@@ -164,10 +164,19 @@ fn call_tool(bus: &mut Bus, params: &Value, now: u64) -> Result<Value, String> {
             let token = str_arg(&args, "token")?;
             let to = str_arg(&args, "to")?;
             let body = str_arg(&args, "body")?;
-            let msg = bus
+            let sent = bus
                 .send(&token, &to, &body, now)
                 .map_err(|e| e.to_string())?;
-            format!("{} -> {} へ送信しました (id={})", msg.from, msg.to, msg.id)
+            let m = &sent.msg;
+            let mut text = format!("{} -> {} へ送信しました (id={})", m.from, m.to, m.id);
+            if sent.dropped > 0 {
+                // 黙って消さない。宛先が受け取りに来ていないことを送信側に知らせる
+                text.push_str(&format!(
+                    "\n（{} の受信箱が上限に達したため、古い {} 件を破棄しました）",
+                    m.to, sent.dropped
+                ));
+            }
+            text
         }
         "poll_messages" => {
             let token = str_arg(&args, "token")?;
