@@ -51,6 +51,10 @@ pub fn handle(bus: &mut Bus, raw: &str, now: u64) -> Outcome {
         ));
     };
 
+    // 失効したピアを先に落とす。これをしないと list_peers が実体のないピアを
+    // 返し、send_message の到達性チェックも幽霊を「生存」と誤判定する。
+    bus.sweep(now);
+
     let method = req.get("method").and_then(Value::as_str);
     let id = req.get("id").cloned();
 
@@ -169,6 +173,26 @@ fn call_tool(bus: &mut Bus, params: &Value, now: u64) -> Result<Value, String> {
                 .map_err(|e| e.to_string())?;
             let m = &sent.msg;
             let mut text = format!("{} -> {} へ送信しました (id={})", m.from, m.to, m.id);
+
+            // 未登録の宛先へも送れる仕様（相手が後から登録して受け取れる）だが、
+            // そのぶん「宛先を間違えた」ことに送信側が気づけない。実際に、中継網の
+            // ピア名ではなく Remote Control の表示名を宛先にした5通が、誰も取りに
+            // 来ない受信箱に滞留したまま数日気づかれなかった。
+            // 送信は成功のままにし、警告だけ添える。
+            if !bus.peers().iter().any(|p| p == &to) {
+                let peers = bus.peers();
+                let list = if peers.is_empty() {
+                    "（現在ゼロ）".to_string()
+                } else {
+                    peers.join(", ")
+                };
+                text.push_str(&format!(
+                    "\n\n注意: '{to}' はいま中継網に接続していません。宛先の綴りを確認してください。\n\
+                     相手が後から接続すれば受け取れますが、名前が違っていた場合は誰にも読まれません。\n\
+                     接続中: {list}"
+                ));
+            }
+
             if sent.dropped > 0 {
                 // 黙って消さない。宛先が受け取りに来ていないことを送信側に知らせる
                 text.push_str(&format!(
@@ -397,6 +421,75 @@ mod tests {
         let err = call_err(&mut bus, "register", json!({"name":"honten"}));
         assert_eq!(err["code"], code::INVALID_PARAMS);
         assert!(err["message"].as_str().unwrap().contains("既に使われ"));
+    }
+
+    #[test]
+    fn 接続していない宛先へ送ると警告が付く() {
+        // 宛先を間違えても送信は成功するため、送信側が気づけない。
+        // 実際に Remote Call の表示名を宛先にした5通が数日滞留した
+        let mut bus = Bus::new();
+        let honten = register(&mut bus, "honten");
+        register(&mut bus, "shiten");
+
+        let out = call(
+            &mut bus,
+            "send_message",
+            json!({ "token": honten, "to": "Agy(支店)", "body": "届かない" }),
+        );
+
+        assert!(out.contains("送信しました"), "送信自体は成功する");
+        assert!(out.contains("接続していません"), "警告が出る");
+        assert!(
+            out.contains("shiten"),
+            "接続中のピアを示して綴りを直せるようにする"
+        );
+    }
+
+    #[test]
+    fn 接続中の宛先へ送っても警告は出ない() {
+        let mut bus = Bus::new();
+        let honten = register(&mut bus, "honten");
+        register(&mut bus, "shiten");
+
+        let out = call(
+            &mut bus,
+            "send_message",
+            json!({ "token": honten, "to": "shiten", "body": "届く" }),
+        );
+
+        assert!(out.contains("送信しました"));
+        assert!(!out.contains("接続していません"), "正常時に警告を出さない");
+    }
+
+    #[test]
+    fn 失効したピアは接続中とみなさない() {
+        // sweep をかけずに peers() を見ると幽霊を生存と誤判定する
+        let mut bus = Bus::new();
+        // shiten は時刻 0 に登録して以降まったく接触しない = 失効する。
+        // honten は送信時点で登録するので生きている（実運用でも送信側は
+        // poll し続けているため失効しない）
+        bus.register("shiten", None, 0).unwrap();
+        let honten = bus
+            .register("honten", None, crate::bus::PEER_TTL_SECS + 1)
+            .unwrap();
+
+        // TTL を跨いだ時刻で送る。shiten は既に失効しているはず
+        let raw = serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "send_message",
+                        "arguments": { "token": honten, "to": "shiten", "body": "留守宛" } }
+        }))
+        .unwrap();
+        let Outcome::Reply(resp) = handle(&mut bus, &raw, crate::bus::PEER_TTL_SECS + 1) else {
+            panic!("応答が返るはず");
+        };
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+
+        assert!(
+            text.contains("接続していません"),
+            "失効ピアは接続中扱いしない"
+        );
     }
 
     #[test]
